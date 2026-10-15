@@ -1,3 +1,4 @@
+import { v4 as uuidv4 } from 'uuid'
 import { forageStorage } from 'src/ts/globalApi.svelte'
 import { language } from 'src/lang'
 
@@ -92,35 +93,121 @@ export function makeJobFetch(opts: JobFetchOptions): typeof fetch {
         const url = typeof input === 'string' ? input : input.toString()
         const signal = init?.signal ?? undefined
 
-        // 1. Create the job. Infra failures fall back to the direct path;
-        //    409 (chat already generating) must surface, never fall back.
-        let created: Response
-        try {
-            created = await fetch('/api/model-jobs', {
-                method: 'POST',
-                headers: { 'content-type': 'application/json', ...await authHeader() },
-                body: JSON.stringify({
-                    targetUrl: url,
-                    method: init?.method ?? 'POST',
-                    headers: (init?.headers as Record<string, string>) ?? {},
-                    body: typeof init?.body === 'string' ? init.body : undefined,
-                    chatId: opts.realChatId,
-                    generationId: opts.generationId,
-                    adapterKind: opts.adapterKind,
-                    model: opts.model,
-                    modelLabel: opts.modelLabel,
-                    inputTokens: opts.inputTokens,
-                    outputTokens: opts.outputTokens,
-                    maxContext: opts.maxContext,
-                    kind: opts.jobKind ?? 'main',
-                    streaming: opts.streaming,
-                    timeoutMs: opts.timeoutMs,
-                }),
-                signal,
-            })
-        } catch (err) {
-            if (signal?.aborted) throw err
-            console.warn('[ModelJob] job creation failed, falling back to direct request path', err)
+        // 1. Create the job. 409 (chat already generating) must surface, never
+        //    fall back.
+        //
+        //    A network-level rejection does NOT prove the server never got the
+        //    POST. The dominant mobile pattern — send, then background the tab
+        //    — freezes this fetch in flight; the server receives it and starts
+        //    the upstream, and the fetch rejects on resume with the response
+        //    lost. Falling straight back to the direct path then fires a SECOND
+        //    upstream request under the same generationId: the direct response
+        //    lands in the chat, the orphaned job finishes unclaimed, and the
+        //    next recovery pass overwrites the reply with the other response
+        //    (fillPartialMessage matches on generationId and keeps the longer
+        //    text). So creation is retried with the same per-attempt requestKey
+        //    — the server hands back the job it already started — and the
+        //    direct fallback is reserved for a server that stays unreachable or
+        //    answers 404/5xx (older or misbehaving server).
+        const requestKey = uuidv4()
+        const baseDelay = opts.reconnectBaseDelayMs ?? 1000
+        const abortError = () => new DOMException('The operation was aborted.', 'AbortError')
+        const sleepAbortable = (ms: number) => new Promise<void>((resolve, reject) => {
+            const cleanup = () => {
+                clearTimeout(timer)
+                signal?.removeEventListener('abort', onAbort)
+            }
+            const onAbort = () => { cleanup(); reject(abortError()) }
+            const timer = setTimeout(() => { cleanup(); resolve() }, ms)
+            if (signal?.aborted) { onAbort(); return }
+            signal?.addEventListener('abort', onAbort)
+        })
+        // Aborted while the create response was read: the job runs, but its id
+        // never arrived. Find it by this generation's id and stop it.
+        const deleteOrphanOnAbort = () => {
+            if (!opts.generationId) return
+            void (async () => {
+                const listed = await fetch('/api/model-jobs?active=1', { headers: await authHeader() })
+                const { jobs } = await listed.json() as { jobs?: { id: string, chatId?: string, generationId?: string }[] }
+                const own = jobs?.find((job) => job.generationId === opts.generationId && job.chatId === opts.realChatId)
+                if (own) await fetch(`/api/model-jobs/${own.id}`, { method: 'DELETE', headers: await authHeader() })
+            })().catch(() => {})
+        }
+        let created: Response | null = null
+        let createdJobId: string | undefined
+        let createError: unknown = null
+        // The server answered 2xx at least once: a job for this requestKey
+        // EXISTS. From then on falling back to the direct path would
+        // double-generate, so exhaustion surfaces as a lost connection instead
+        // (recovery slots the job's response in at the next return).
+        let jobCreated = false
+        for (let attempt = 0; attempt < RECONNECT_MAX_ATTEMPTS; attempt++) {
+            try {
+                if (attempt > 0) await sleepAbortable(baseDelay * 2 ** (attempt - 1))
+                const res = await fetch('/api/model-jobs', {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json', ...await authHeader() },
+                    body: JSON.stringify({
+                        targetUrl: url,
+                        method: init?.method ?? 'POST',
+                        headers: (init?.headers as Record<string, string>) ?? {},
+                        body: typeof init?.body === 'string' ? init.body : undefined,
+                        chatId: opts.realChatId,
+                        generationId: opts.generationId,
+                        adapterKind: opts.adapterKind,
+                        model: opts.model,
+                        modelLabel: opts.modelLabel,
+                        inputTokens: opts.inputTokens,
+                        outputTokens: opts.outputTokens,
+                        maxContext: opts.maxContext,
+                        kind: opts.jobKind ?? 'main',
+                        streaming: opts.streaming,
+                        timeoutMs: opts.timeoutMs,
+                        requestKey,
+                    }),
+                    signal,
+                })
+                // A reverse proxy's own timeout page (gateway-shaped status) is
+                // a transport failure, not the server's answer — the POST may
+                // well have landed. Retrying is safe: the requestKey makes it
+                // idempotent.
+                if (res.status === 408 || res.status >= 502) {
+                    console.warn('[ModelJob] job creation answered by an intermediary (', res.status, '), retrying')
+                    created = res
+                    continue
+                }
+                if (res.ok) {
+                    jobCreated = true
+                    try {
+                        createdJobId = (await res.json()).jobId
+                    } catch (err) {
+                        // Aborted mid-read: the outer catch stops the orphan.
+                        if (signal?.aborted) throw err
+                        // Body lost in transit (tab froze between headers and
+                        // body): replay the POST to learn the job's id.
+                        createError = err
+                        created = null
+                        continue
+                    }
+                }
+                created = res
+                createError = null
+                break
+            } catch (err) {
+                if (signal?.aborted) {
+                    if (jobCreated) deleteOrphanOnAbort()
+                    throw err
+                }
+                createError = err
+                created = null
+            }
+        }
+        if (created === null || (created.ok && createdJobId === undefined)) {
+            if (jobCreated) {
+                console.warn('[ModelJob] job created but its id never arrived', createError)
+                throw new ModelJobConnectionLostError()
+            }
+            console.warn('[ModelJob] job creation failed, falling back to direct request path', createError)
             return opts.fallbackFetch(input, init)
         }
         let jobId: string
@@ -140,24 +227,11 @@ export function makeJobFetch(opts: JobFetchOptions): typeof fetch {
             console.warn('[ModelJob] chat busy with this generation\'s own job, reattaching', busy.jobId)
             jobId = busy.jobId
         } else if (!created.ok) {
+            if (jobCreated) throw new ModelJobConnectionLostError()
             console.warn('[ModelJob] job creation rejected (', created.status, '), falling back to direct request path')
             return opts.fallbackFetch(input, init)
         } else {
-            try {
-                jobId = (await created.json()).jobId
-            } catch (err) {
-                // Aborted while the create response was read: the job runs,
-                // but its id never arrived. Find it by this generation's id.
-                if (signal?.aborted && opts.generationId) {
-                    void (async () => {
-                        const listed = await fetch('/api/model-jobs?active=1', { headers: await authHeader() })
-                        const { jobs } = await listed.json() as { jobs?: { id: string, chatId?: string, generationId?: string }[] }
-                        const own = jobs?.find((job) => job.generationId === opts.generationId && job.chatId === opts.realChatId)
-                        if (own) await fetch(`/api/model-jobs/${own.id}`, { method: 'DELETE', headers: await authHeader() })
-                    })().catch(() => {})
-                }
-                throw err
-            }
+            jobId = createdJobId!
         }
 
         // Abort propagation: aborting the request DELETEs the job (server
@@ -192,19 +266,6 @@ export function makeJobFetch(opts: JobFetchOptions): typeof fetch {
         // connection, not a lost generation — surface the same
         // ModelJobConnectionLostError the mid-stream path uses (recovery picks
         // the job up at the next return), never the raw TypeError.
-        const baseDelay = opts.reconnectBaseDelayMs ?? 1000
-        const abortError = () => new DOMException('The operation was aborted.', 'AbortError')
-        const sleepAbortable = (ms: number) => new Promise<void>((resolve, reject) => {
-            const cleanup = () => {
-                clearTimeout(timer)
-                signal?.removeEventListener('abort', onAbort)
-            }
-            const onAbort = () => { cleanup(); reject(abortError()) }
-            const timer = setTimeout(() => { cleanup(); resolve() }, ms)
-            if (signal?.aborted) { onAbort(); return }
-            signal?.addEventListener('abort', onAbort)
-        })
-
         let streamRes: Response | null = null
         for (let attempt = 0; attempt < RECONNECT_MAX_ATTEMPTS; attempt++) {
             try {

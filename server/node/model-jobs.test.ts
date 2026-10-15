@@ -297,6 +297,35 @@ describe('model-jobs', () => {
         await waitForStatus(base, third.json.jobId, ['done'])
     })
 
+    it('replaying a creation with the same requestKey returns the same job (no second upstream request)', async () => {
+        upstream.chunks = ['data: x\n\n']
+        upstream.delayMs = 20
+        upstream.hang = true
+
+        const chatId = 'chat-request-key'
+        const first = await createJob({ chatId, requestKey: 'key-1' })
+        expect(first.status).toBe(200)
+        expect(first.json.reused).toBeUndefined()
+        // Replay while running: the per-chat guard must NOT answer 409 — the
+        // client lost the first response and is asking for its own job back.
+        const replay = await createJob({ chatId, requestKey: 'key-1' })
+        expect(replay.status).toBe(200)
+        expect(replay.json).toEqual({ jobId: first.json.jobId, reused: true })
+        // A different key is a different attempt → the guard still applies.
+        const other = await createJob({ chatId, requestKey: 'key-2' })
+        expect(other.status).toBe(409)
+
+        await fetch(`${base}/api/model-jobs/${first.json.jobId}`, {
+            method: 'DELETE',
+            headers: { 'risu-auth': AUTH_TOKEN },
+        })
+        await waitForStatus(base, first.json.jobId, ['aborted'])
+        upstream.hang = false
+        // Still idempotent after the job went terminal.
+        const late = await createJob({ chatId, requestKey: 'key-1' })
+        expect(late.json).toEqual({ jobId: first.json.jobId, reused: true })
+    })
+
     it('claim flow: unclaimed listing, claim, then excluded', async () => {
         upstream.chunks = ['data: claimable\n\n']
         upstream.delayMs = 10

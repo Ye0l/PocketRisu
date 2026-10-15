@@ -220,6 +220,18 @@ function createModelJobs(opts = {}) {
     try {
         db.exec(`ALTER TABLE model_jobs ADD COLUMN max_context INTEGER`);
     } catch { /* column already present */ }
+    // Client-chosen idempotency key, unique per job-creation ATTEMPT (one
+    // makeJobFetch invocation). A creation POST whose response was lost — the
+    // mobile "send, then background the tab" pattern: the server got the POST
+    // and started the upstream, but the frozen fetch rejects on resume — is
+    // retried with the same key and gets the SAME job back instead of a second
+    // upstream request. Deliberately not the generationId: the send pipeline
+    // legitimately re-requests under one generationId (banned-charset retry,
+    // retry after a failed attempt) and each of those must be a fresh job.
+    try {
+        db.exec(`ALTER TABLE model_jobs ADD COLUMN request_key TEXT`);
+    } catch { /* column already present */ }
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_model_jobs_request_key ON model_jobs(request_key)`);
 
     // Resumable sends: one tombstone per chat marking "a send was started here
     // and has not concluded". Holds NO pipeline state — the send's durable
@@ -236,9 +248,10 @@ function createModelJobs(opts = {}) {
     `);
 
     const stmtInsert = db.prepare(`
-        INSERT INTO model_jobs (id, chat_id, generation_id, adapter_kind, model, model_label, target_origin, kind, streaming, input_tokens, output_tokens, max_context, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)
+        INSERT INTO model_jobs (id, chat_id, generation_id, adapter_kind, model, model_label, target_origin, kind, streaming, input_tokens, output_tokens, max_context, request_key, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)
     `);
+    const stmtByRequestKey = db.prepare(`SELECT id FROM model_jobs WHERE request_key = ? AND chat_id = ? LIMIT 1`);
     const stmtGet = db.prepare(`SELECT * FROM model_jobs WHERE id = ?`);
     const stmtRunningForChat = db.prepare(`SELECT id, generation_id FROM model_jobs WHERE chat_id = ? AND status = 'running' AND kind = 'main' LIMIT 1`);
     const stmtSetUpstream = db.prepare(`UPDATE model_jobs SET upstream_status = ?, content_type = ? WHERE id = ?`);
@@ -504,6 +517,17 @@ function createModelJobs(opts = {}) {
             return { error: 'Body must be a string', httpStatus: 400 };
         }
         const kind = arg.kind === 'aux' ? 'aux' : 'main';
+        // Idempotent replay of a creation POST whose response never reached
+        // the client: hand back the job it already started. Checked BEFORE the
+        // per-chat guard — that job is usually still running, and a 409 here
+        // would turn a lost response into a spurious conflict.
+        const requestKey = typeof arg.requestKey === 'string' && arg.requestKey.length > 0
+            ? arg.requestKey.slice(0, 128)
+            : null;
+        if (requestKey) {
+            const existing = stmtByRequestKey.get(requestKey, chatId);
+            if (existing) return { jobId: existing.id, reused: true };
+        }
         // Per-chat single-job guard — one active generation per chat, enforced
         // server-side at creation time (design §3 "중단"). Main jobs only: aux
         // side requests share the send's chat but are not generations.
@@ -541,6 +565,7 @@ function createModelJobs(opts = {}) {
             Number.isFinite(arg.inputTokens) ? Math.max(0, Math.round(arg.inputTokens)) : null,
             Number.isFinite(arg.outputTokens) ? Math.max(0, Math.round(arg.outputTokens)) : null,
             Number.isFinite(arg.maxContext) ? Math.max(0, Math.round(arg.maxContext)) : null,
+            requestKey,
             Date.now()
         );
         activeJobs.set(jobId, job);
@@ -686,13 +711,14 @@ function createModelJobs(opts = {}) {
                 maxContext: req.body?.maxContext,
                 kind: req.body?.kind,
                 streaming: !!req.body?.streaming,
-                timeoutMs: req.body?.timeoutMs
+                timeoutMs: req.body?.timeoutMs,
+                requestKey: req.body?.requestKey
             });
             if (result.error) {
                 res.status(result.httpStatus).send({ error: result.error, jobId: result.jobId, generationId: result.generationId });
                 return;
             }
-            res.send({ jobId: result.jobId });
+            res.send(result.reused ? { jobId: result.jobId, reused: true } : { jobId: result.jobId });
         });
 
         app.get('/api/model-jobs', async (req, res) => {

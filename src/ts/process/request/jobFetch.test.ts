@@ -25,6 +25,13 @@ function streamOf(...chunks: string[]): ReadableStream<Uint8Array> {
 interface ServerBehavior {
     create?: { status: number, body?: unknown }
     createReject?: Error
+    /** Reject this many POST /api/model-jobs fetches (network-level) before
+     *  answering — the frozen-tab "server got it, response lost" case. */
+    createRejectTimes?: number
+    /** Answer this many creation POSTs with a middlebox 504 first. */
+    createIntermediaryTimes?: number
+    /** Serve this many 200 creation responses whose body read rejects. */
+    createBodyFailTimes?: number
     streamChunks?: string[]
     /** Per-attach chunk sets: successive GET /stream calls consume successive
      *  entries (the last repeats) — for reconnect tests. Overrides streamChunks. */
@@ -56,6 +63,21 @@ function setupServer(behavior: ServerBehavior) {
         const method = init?.method ?? 'GET'
         if (url === '/api/model-jobs' && method === 'POST') {
             if (behavior.createReject) throw behavior.createReject
+            if (behavior.createRejectTimes && behavior.createRejectTimes > 0) {
+                behavior.createRejectTimes -= 1
+                throw new TypeError('Failed to fetch')
+            }
+            if (behavior.createIntermediaryTimes && behavior.createIntermediaryTimes > 0) {
+                behavior.createIntermediaryTimes -= 1
+                return new Response('<html>504 Gateway Time-out</html>', { status: 504 })
+            }
+            if (behavior.createBodyFailTimes && behavior.createBodyFailTimes > 0) {
+                behavior.createBodyFailTimes -= 1
+                const broken = new ReadableStream<Uint8Array>({
+                    start(c) { c.error(new TypeError('network error')) },
+                })
+                return new Response(broken, { status: 200 })
+            }
             const c = behavior.create ?? { status: 200, body: { jobId: 'job-1' } }
             return new Response(JSON.stringify(c.body ?? {}), { status: c.status })
         }
@@ -429,13 +451,75 @@ describe('makeJobFetch', () => {
         expect(callsFor(calls, '/api/model-jobs/job-1', 'DELETE')).toHaveLength(0)
     })
 
-    test('creation network failure falls back to the direct fetch with the same args', async () => {
-        setupServer({ createReject: new TypeError('Failed to fetch') })
-        const opts = makeOpts()
+    test('creation network failure falls back to the direct fetch once retries are exhausted', async () => {
+        const { calls } = setupServer({ createReject: new TypeError('Failed to fetch') })
+        const opts = makeOpts({ reconnectBaseDelayMs: 1 })
         const init = { method: 'POST', body: '{}' }
         const res = await makeJobFetch(opts)('https://provider.example/v1/chat', init)
         expect(await res.text()).toBe('fallback')
         expect(opts.fallbackFetch).toHaveBeenCalledWith('https://provider.example/v1/chat', init)
+        expect(callsFor(calls, '/api/model-jobs', 'POST')).toHaveLength(5)
+    })
+
+    test('a lost creation response is replayed with the same requestKey instead of falling back (no double generation)', async () => {
+        // Send, then background the tab: the server got the POST and started
+        // the upstream, but the frozen fetch rejects on resume. Falling back
+        // would fire a second upstream request under the same generationId.
+        const { calls } = setupServer({ createRejectTimes: 2, streamChunks: ['hello'], job: { status: 'done' } })
+        const opts = makeOpts({ reconnectBaseDelayMs: 1 })
+        const res = await makeJobFetch(opts)('https://provider.example/v1/chat', { method: 'POST', body: '{}' })
+        expect(await res.text()).toBe('hello')
+        expect(opts.fallbackFetch).not.toHaveBeenCalled()
+        const creates = callsFor(calls, '/api/model-jobs', 'POST')
+        expect(creates).toHaveLength(3)
+        const keys = creates.map((c) => JSON.parse(c.init?.body as string).requestKey)
+        expect(typeof keys[0]).toBe('string')
+        expect(new Set(keys).size).toBe(1)
+    })
+
+    test('each invocation uses a fresh requestKey (pipeline retries stay separate jobs)', async () => {
+        const { calls } = setupServer({ streamChunks: ['x'], job: { status: 'done' } })
+        const jobFetch = makeJobFetch(makeOpts())
+        await drain(await jobFetch('https://provider.example/v1/chat', { method: 'POST', body: '{}' }))
+        await drain(await jobFetch('https://provider.example/v1/chat', { method: 'POST', body: '{}' }))
+        const keys = callsFor(calls, '/api/model-jobs', 'POST').map((c) => JSON.parse(c.init?.body as string).requestKey)
+        expect(keys).toHaveLength(2)
+        expect(keys[0]).not.toBe(keys[1])
+    })
+
+    test('a gateway 504 on creation is retried, not treated as an older server', async () => {
+        const { calls } = setupServer({ createIntermediaryTimes: 1, streamChunks: ['ok'], job: { status: 'done' } })
+        const opts = makeOpts({ reconnectBaseDelayMs: 1 })
+        const res = await makeJobFetch(opts)('https://provider.example/v1/chat', { method: 'POST', body: '{}' })
+        expect(await res.text()).toBe('ok')
+        expect(opts.fallbackFetch).not.toHaveBeenCalled()
+        expect(callsFor(calls, '/api/model-jobs', 'POST')).toHaveLength(2)
+    })
+
+    test('a creation body lost after a 2xx is replayed to learn the job id', async () => {
+        const { calls } = setupServer({ createBodyFailTimes: 1, streamChunks: ['ok'], job: { status: 'done' } })
+        const opts = makeOpts({ reconnectBaseDelayMs: 1 })
+        const res = await makeJobFetch(opts)('https://provider.example/v1/chat', { method: 'POST', body: '{}' })
+        expect(await res.text()).toBe('ok')
+        expect(opts.fallbackFetch).not.toHaveBeenCalled()
+        expect(callsFor(calls, '/api/model-jobs', 'POST')).toHaveLength(2)
+    })
+
+    test('once the server confirmed a job, exhaustion is a lost connection — never the direct fallback', async () => {
+        setupServer({ createBodyFailTimes: 1 })
+        // First answer is a 2xx with a lost body, then the network stays down.
+        const behaviorFetch = globalThis.fetch as unknown as (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
+        let n = 0
+        vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            if (String(input) === '/api/model-jobs' && init?.method === 'POST' && n++ > 0) {
+                throw new TypeError('Failed to fetch')
+            }
+            return behaviorFetch(input, init)
+        }))
+        const opts = makeOpts({ reconnectBaseDelayMs: 1 })
+        await expect(makeJobFetch(opts)('https://provider.example/v1/chat', { method: 'POST', body: '{}' }))
+            .rejects.toThrow(ModelJobConnectionLostError)
+        expect(opts.fallbackFetch).not.toHaveBeenCalled()
     })
 
     test('creation 5xx (misbehaving/older server) falls back to the direct fetch', async () => {
