@@ -68,9 +68,10 @@ export interface JobFetchOptions {
     /** Base delay of the stream-reattach backoff (default 1000ms). Injectable
      *  so tests do not sleep for real. */
     reconnectBaseDelayMs?: number
-    /** Used when job creation fails for infra reasons (network error / 404 /
-     *  5xx — older or misbehaving server): the request transparently falls
-     *  back to the direct proxied path. NOT used after the job exists. */
+    /** Used when the server ANSWERS job creation with 404 / 5xx (older or
+     *  misbehaving server): the request transparently falls back to the direct
+     *  proxied path. Never used for a rejected create (the job may exist) nor
+     *  after the job exists. */
     fallbackFetch: typeof fetch
 }
 
@@ -92,36 +93,71 @@ export function makeJobFetch(opts: JobFetchOptions): typeof fetch {
         const url = typeof input === 'string' ? input : input.toString()
         const signal = init?.signal ?? undefined
 
-        // 1. Create the job. Infra failures fall back to the direct path;
-        //    409 (chat already generating) must surface, never fall back.
-        let created: Response
-        try {
-            created = await fetch('/api/model-jobs', {
-                method: 'POST',
-                headers: { 'content-type': 'application/json', ...await authHeader() },
-                body: JSON.stringify({
-                    targetUrl: url,
-                    method: init?.method ?? 'POST',
-                    headers: (init?.headers as Record<string, string>) ?? {},
-                    body: typeof init?.body === 'string' ? init.body : undefined,
-                    chatId: opts.realChatId,
-                    generationId: opts.generationId,
-                    adapterKind: opts.adapterKind,
-                    model: opts.model,
-                    modelLabel: opts.modelLabel,
-                    inputTokens: opts.inputTokens,
-                    outputTokens: opts.outputTokens,
-                    maxContext: opts.maxContext,
-                    kind: opts.jobKind ?? 'main',
-                    streaming: opts.streaming,
-                    timeoutMs: opts.timeoutMs,
-                }),
-                signal,
-            })
-        } catch (err) {
-            if (signal?.aborted) throw err
-            console.warn('[ModelJob] job creation failed, falling back to direct request path', err)
-            return opts.fallbackFetch(input, init)
+        // Shared backoff helpers (create retry, stream attach, reattach).
+        const baseDelay = opts.reconnectBaseDelayMs ?? 1000
+        const abortError = () => new DOMException('The operation was aborted.', 'AbortError')
+        const sleepAbortable = (ms: number) => new Promise<void>((resolve, reject) => {
+            const cleanup = () => {
+                clearTimeout(timer)
+                signal?.removeEventListener('abort', onAbort)
+            }
+            const onAbort = () => { cleanup(); reject(abortError()) }
+            const timer = setTimeout(() => { cleanup(); resolve() }, ms)
+            if (signal?.aborted) { onAbort(); return }
+            signal?.addEventListener('abort', onAbort)
+        })
+
+        // 1. Create the job. A served 404/5xx (older or misbehaving server)
+        //    falls back to the direct path; 409 (chat already generating) must
+        //    surface, never fall back.
+        //
+        //    A REJECTED create never falls back: the dominant mobile pattern is
+        //    "send, then lock the screen" — the tab freezes with this POST in
+        //    flight, the server has usually already received it and started the
+        //    job, and only the response was lost. Falling back to the direct
+        //    path there sent the same prompt to the provider a second time (the
+        //    duplicate generation seen on return). Instead the POST is retried:
+        //    the server answers a re-sent generationId with the job it already
+        //    holds (409 own-generation while running, the same jobId once done),
+        //    so the retry attaches to the original request.
+        const createBody = JSON.stringify({
+            targetUrl: url,
+            method: init?.method ?? 'POST',
+            headers: (init?.headers as Record<string, string>) ?? {},
+            body: typeof init?.body === 'string' ? init.body : undefined,
+            chatId: opts.realChatId,
+            generationId: opts.generationId,
+            adapterKind: opts.adapterKind,
+            model: opts.model,
+            modelLabel: opts.modelLabel,
+            inputTokens: opts.inputTokens,
+            outputTokens: opts.outputTokens,
+            maxContext: opts.maxContext,
+            kind: opts.jobKind ?? 'main',
+            streaming: opts.streaming,
+            timeoutMs: opts.timeoutMs,
+        })
+        let created: Response | null = null
+        for (let attempt = 0; attempt < RECONNECT_MAX_ATTEMPTS && created === null; attempt++) {
+            try {
+                if (attempt > 0) await sleepAbortable(baseDelay * 2 ** (attempt - 1))
+                created = await fetch('/api/model-jobs', {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json', ...await authHeader() },
+                    body: createBody,
+                    signal,
+                })
+            } catch (err) {
+                if (signal?.aborted) throw err
+                console.warn('[ModelJob] job creation request failed, retrying', err)
+            }
+        }
+        if (created === null) {
+            // Server unreachable for the whole budget. Surface a network
+            // failure (the request retry loop re-sends with the same
+            // generationId, which the server deduplicates) — never the direct
+            // path, which would double-generate if any attempt had landed.
+            throw new TypeError('model job creation failed: server unreachable')
         }
         let jobId: string
         if (created.status === 409) {
@@ -192,19 +228,6 @@ export function makeJobFetch(opts: JobFetchOptions): typeof fetch {
         // connection, not a lost generation — surface the same
         // ModelJobConnectionLostError the mid-stream path uses (recovery picks
         // the job up at the next return), never the raw TypeError.
-        const baseDelay = opts.reconnectBaseDelayMs ?? 1000
-        const abortError = () => new DOMException('The operation was aborted.', 'AbortError')
-        const sleepAbortable = (ms: number) => new Promise<void>((resolve, reject) => {
-            const cleanup = () => {
-                clearTimeout(timer)
-                signal?.removeEventListener('abort', onAbort)
-            }
-            const onAbort = () => { cleanup(); reject(abortError()) }
-            const timer = setTimeout(() => { cleanup(); resolve() }, ms)
-            if (signal?.aborted) { onAbort(); return }
-            signal?.addEventListener('abort', onAbort)
-        })
-
         let streamRes: Response | null = null
         for (let attempt = 0; attempt < RECONNECT_MAX_ATTEMPTS; attempt++) {
             try {

@@ -25,6 +25,8 @@ function streamOf(...chunks: string[]): ReadableStream<Uint8Array> {
 interface ServerBehavior {
     create?: { status: number, body?: unknown }
     createReject?: Error
+    /** Reject this many POST /api/model-jobs (network-level) before serving. */
+    createRejectTimes?: number
     streamChunks?: string[]
     /** Per-attach chunk sets: successive GET /stream calls consume successive
      *  entries (the last repeats) — for reconnect tests. Overrides streamChunks. */
@@ -56,6 +58,10 @@ function setupServer(behavior: ServerBehavior) {
         const method = init?.method ?? 'GET'
         if (url === '/api/model-jobs' && method === 'POST') {
             if (behavior.createReject) throw behavior.createReject
+            if (behavior.createRejectTimes && behavior.createRejectTimes > 0) {
+                behavior.createRejectTimes -= 1
+                throw new TypeError('Failed to fetch')
+            }
             const c = behavior.create ?? { status: 200, body: { jobId: 'job-1' } }
             return new Response(JSON.stringify(c.body ?? {}), { status: c.status })
         }
@@ -429,13 +435,25 @@ describe('makeJobFetch', () => {
         expect(callsFor(calls, '/api/model-jobs/job-1', 'DELETE')).toHaveLength(0)
     })
 
-    test('creation network failure falls back to the direct fetch with the same args', async () => {
-        setupServer({ createReject: new TypeError('Failed to fetch') })
-        const opts = makeOpts()
-        const init = { method: 'POST', body: '{}' }
-        const res = await makeJobFetch(opts)('https://provider.example/v1/chat', init)
-        expect(await res.text()).toBe('fallback')
-        expect(opts.fallbackFetch).toHaveBeenCalledWith('https://provider.example/v1/chat', init)
+    test('a rejected create is retried, never sent down the direct path (send-then-lock duplicate)', async () => {
+        // The tab froze with the POST in flight: the server got it, the
+        // response was lost. A direct fallback here would call the provider a
+        // second time; the retry instead lands on the job the server holds.
+        const { calls } = setupServer({ createRejectTimes: 2, streamChunks: ['hello'], job: { status: 'done' } })
+        const opts = makeOpts({ reconnectBaseDelayMs: 1 })
+        const res = await makeJobFetch(opts)('https://provider.example/v1/chat', { method: 'POST', body: '{}' })
+        expect(await res.text()).toBe('hello')
+        expect(callsFor(calls, '/api/model-jobs', 'POST')).toHaveLength(3)
+        expect(opts.fallbackFetch).not.toHaveBeenCalled()
+    })
+
+    test('create rejected for the whole budget throws a network TypeError, never falls back', async () => {
+        const { calls } = setupServer({ createReject: new TypeError('Failed to fetch') })
+        const opts = makeOpts({ reconnectBaseDelayMs: 1 })
+        await expect(makeJobFetch(opts)('https://provider.example/v1/chat', { method: 'POST', body: '{}' }))
+            .rejects.toThrow(TypeError)
+        expect(callsFor(calls, '/api/model-jobs', 'POST')).toHaveLength(5)
+        expect(opts.fallbackFetch).not.toHaveBeenCalled()
     })
 
     test('creation 5xx (misbehaving/older server) falls back to the direct fetch', async () => {

@@ -241,6 +241,17 @@ function createModelJobs(opts = {}) {
     `);
     const stmtGet = db.prepare(`SELECT * FROM model_jobs WHERE id = ?`);
     const stmtRunningForChat = db.prepare(`SELECT id, generation_id FROM model_jobs WHERE chat_id = ? AND status = 'running' AND kind = 'main' LIMIT 1`);
+    // Idempotent re-create: a job of the SAME generation that already got a
+    // successful answer (or an aux job still in flight — aux skips the 409
+    // guard). Main running jobs are answered by the 409 guard instead. A 'done'
+    // job with a non-2xx upstream status (429, 5xx) is NOT reused: the client's
+    // retry loop re-sends the same generationId for exactly those, and they
+    // must reach the provider again.
+    const stmtSameGeneration = db.prepare(`
+        SELECT id FROM model_jobs WHERE chat_id = ? AND generation_id = ? AND kind = ?
+        AND ((status = 'done' AND upstream_status BETWEEN 200 AND 299) OR (status = 'running' AND kind = 'aux'))
+        ORDER BY created_at DESC LIMIT 1
+    `);
     const stmtSetUpstream = db.prepare(`UPDATE model_jobs SET upstream_status = ?, content_type = ? WHERE id = ?`);
     const stmtFinalize = db.prepare(`UPDATE model_jobs SET status = ?, error = ?, ended_at = ?, bytes = ? WHERE id = ?`);
     const stmtClaim = db.prepare(`UPDATE model_jobs SET claimed = 1 WHERE id = ?`);
@@ -504,6 +515,16 @@ function createModelJobs(opts = {}) {
             return { error: 'Body must be a string', httpStatus: 400 };
         }
         const kind = arg.kind === 'aux' ? 'aux' : 'main';
+        // Same generation re-sent (the client lost the create response — a tab
+        // frozen right after send — and retried): hand back the job that already
+        // holds this generation's answer instead of calling the provider again.
+        const generationId = typeof arg.generationId === 'string' && arg.generationId ? arg.generationId : null;
+        if (generationId) {
+            const existing = stmtSameGeneration.get(chatId, generationId, kind);
+            if (existing) {
+                return { jobId: existing.id, existing: true };
+            }
+        }
         // Per-chat single-job guard — one active generation per chat, enforced
         // server-side at creation time (design §3 "중단"). Main jobs only: aux
         // side requests share the send's chat but are not generations.

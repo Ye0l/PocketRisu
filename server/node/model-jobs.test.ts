@@ -297,6 +297,49 @@ describe('model-jobs', () => {
         await waitForStatus(base, third.json.jobId, ['done'])
     })
 
+    it('re-creating a finished generation returns its job instead of calling the provider again', async () => {
+        // The client lost the create response (tab frozen right after send)
+        // and re-sent the same generationId once the job had already finished.
+        upstream.chunks = ['data: once\n\n']
+        upstream.delayMs = 5
+        upstream.hang = false
+        const chatId = 'chat-idempotent'
+        const first = await createJob({ chatId, generationId: 'gen-idem' })
+        expect(first.status).toBe(200)
+        await waitForStatus(base, first.json.jobId, ['done'])
+        upstream.lastReq = null
+
+        const again = await createJob({ chatId, generationId: 'gen-idem' })
+        expect(again.status).toBe(200)
+        expect(again.json.jobId).toBe(first.json.jobId)
+        expect(upstream.lastReq).toBeNull()
+
+        // A new generation in the same chat is a new request.
+        const next = await createJob({ chatId, generationId: 'gen-idem-2' })
+        expect(next.json.jobId).not.toBe(first.json.jobId)
+        await waitForStatus(base, next.json.jobId, ['done'])
+    })
+
+    it('a finished generation with a non-2xx upstream answer is retried for real', async () => {
+        // The request retry loop re-sends the same generationId after a 429 /
+        // 5xx — those must reach the provider again, not replay the error.
+        upstream.chunks = ['{"error":"rate limited"}']
+        upstream.delayMs = 5
+        upstream.hang = false
+        upstream.status = 429
+        try {
+            const chatId = 'chat-idempotent-429'
+            const first = await createJob({ chatId, generationId: 'gen-429' })
+            await waitForStatus(base, first.json.jobId, ['done'])
+            const again = await createJob({ chatId, generationId: 'gen-429' })
+            expect(again.status).toBe(200)
+            expect(again.json.jobId).not.toBe(first.json.jobId)
+            await waitForStatus(base, again.json.jobId, ['done'])
+        } finally {
+            upstream.status = 200
+        }
+    })
+
     it('claim flow: unclaimed listing, claim, then excluded', async () => {
         upstream.chunks = ['data: claimable\n\n']
         upstream.delayMs = 10
